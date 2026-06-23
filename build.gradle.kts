@@ -11,19 +11,22 @@ val projectPackage = "tech.qhuyy"
 
 // ─── Git helpers ─────────────────────────────────────────────────────────────
 
-fun git(vararg args: String): String =
+fun gitProvider(vararg args: String): Provider<String> =
     providers.exec {
         commandLine("git", *args)
         isIgnoreExitValue = true
-    }.standardOutput.asText.map { it.trim() }.getOrElse("unknown")
+    }.standardOutput.asText.map { it.trim() }.orElse("unknown")
 
-// Evaluated once at configuration time; reused by all tasks below
-val gitCommitFull    by lazy { git("rev-parse", "HEAD") }
-val gitCommitShort   by lazy { git("rev-parse", "--short", "HEAD") }
-val gitCommitMessage by lazy { git("log", "-1", "--pretty=%s") }
-val gitCommitTime    by lazy { git("log", "-1", "--pretty=%cI") }
-val gitBranch        by lazy { git("rev-parse", "--abbrev-ref", "HEAD") }
-val gitDirty         by lazy { git("status", "--porcelain").isNotBlank().toString() }
+// Provider<String> — lazy, configuration-cache-safe, serializable
+val gitCommitFull    = gitProvider("rev-parse", "HEAD")
+val gitCommitShort   = gitProvider("rev-parse", "--short", "HEAD")
+val gitCommitMessage = gitProvider("log", "-1", "--pretty=%s")
+val gitCommitTime    = gitProvider("log", "-1", "--pretty=%cI")
+val gitBranch        = gitProvider("rev-parse", "--abbrev-ref", "HEAD")
+val gitDirty         = providers.exec {
+    commandLine("git", "status", "--porcelain")
+    isIgnoreExitValue = true
+}.standardOutput.asText.map { it.trim().isNotBlank().toString() }.orElse("false")
 
 // ─── Git properties generation ───────────────────────────────────────────────
 
@@ -33,22 +36,28 @@ val generateGitProperties by tasks.registering {
     group       = "build"
     description = "Generates git.properties with commit metadata"
 
-    // Up-to-date check: invalidate when HEAD changes
-    inputs.property("git.commit.id", providers.exec {
-        commandLine("git", "rev-parse", "HEAD")
-        isIgnoreExitValue = true
-    }.standardOutput.asText.map { it.trim() }.orElse("unknown"))
+    // Opt out of configuration cache — this task uses non-serializable exec
+    // providers and Instant.now(), which the cache cannot persist.
+    notCompatibleWithConfigurationCache("Uses providers.exec and Instant.now()")
+
+    // Wire providers as inputs so changes invalidate the task
+    inputs.property("git.commit.id",            gitCommitFull)
+    inputs.property("git.commit.id.abbrev",      gitCommitShort)
+    inputs.property("git.commit.message.short",  gitCommitMessage)
+    inputs.property("git.commit.time",           gitCommitTime)
+    inputs.property("git.branch",                gitBranch)
+    inputs.property("git.dirty",                 gitDirty)
 
     outputs.file(gitPropertiesOutput)
 
     doLast {
         val props = mapOf(
-            "git.commit.id"            to gitCommitFull,
-            "git.commit.id.abbrev"     to gitCommitShort,
-            "git.commit.message.short" to gitCommitMessage,
-            "git.commit.time"          to gitCommitTime,
-            "git.branch"               to gitBranch,
-            "git.dirty"                to gitDirty,
+            "git.commit.id"            to gitCommitFull.get(),
+            "git.commit.id.abbrev"     to gitCommitShort.get(),
+            "git.commit.message.short" to gitCommitMessage.get(),
+            "git.commit.time"          to gitCommitTime.get(),
+            "git.branch"               to gitBranch.get(),
+            "git.dirty"                to gitDirty.get(),
             "git.build.time"           to Instant.now().toString(),
         )
 
@@ -119,7 +128,9 @@ tasks.processResources {
 
 tasks.shadowJar {
     archiveClassifier.set("")
-    archiveFileName.set("${project.name}-${project.version}+${gitCommitShort}.jar")
+    archiveFileName.set(
+        providers.provider { "${project.name}-${project.version}+${gitCommitShort.get()}.jar" }
+    )
 
     // Bundle only what we ship; everything else is provided by the server
     dependencies {
